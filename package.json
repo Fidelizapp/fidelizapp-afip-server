@@ -1,0 +1,17 @@
+{
+  "name": "fidelizapp-afip-server",
+  "version": "1.0.0",
+  "description": "Servidor AFIP para FidelizApp — emite facturas electrónicas via WSFEv1",
+  "main": "afip-server.js",
+  "scripts": {
+    "start": "node afip-server.js",
+    "dev": "node afip-server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "@afipsdk/afip.js": "^0.3.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
