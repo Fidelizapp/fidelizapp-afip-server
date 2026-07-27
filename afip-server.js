@@ -166,6 +166,84 @@ app.post('/puntos-venta', auth, async (req, res) => {
   }
 });
 
+// ── GET /padron?cuit=XXXXXXXXXXX — razón social real desde el padrón AFIP ──
+// Usa el primer CUIT con certificado registrado como "consultante" ante AFIP.
+app.get('/padron', auth, async (req, res) => {
+  try {
+    const cuitConsultado = String(req.query.cuit || '').replace(/\D/g, '');
+    if (cuitConsultado.length !== 11) {
+      return res.status(400).json({ ok: false, error: 'CUIT inválido (deben ser 11 dígitos)' });
+    }
+
+    // CUIT que hace la consulta: el propio, o el primero con certificado cargado
+    let cuitConsultante = String(req.query.desde || '').replace(/\D/g, '');
+    if (!cuitConsultante) {
+      const disponibles = fs.existsSync(CERTS_DIR)
+        ? fs.readdirSync(CERTS_DIR).filter(f => f.endsWith('.crt')).map(f => f.replace('.crt', ''))
+        : [];
+      cuitConsultante = disponibles.includes(cuitConsultado) ? cuitConsultado : disponibles[0];
+    }
+    if (!cuitConsultante) {
+      return res.status(400).json({ ok: false, error: 'No hay ningún certificado registrado en el servidor' });
+    }
+
+    const afip = await getAfip(cuitConsultante, false);
+
+    let data = null;
+    // Padrón A13 es el más completo; si el CUIT no tiene ese WS habilitado, probamos A5 y A4
+    for (const ws of ['RegisterScopeThirteen', 'RegisterScopeFive', 'RegisterScopeFour']) {
+      if (!afip[ws]) continue;
+      try {
+        data = await afip[ws].getTaxpayerDetails(Number(cuitConsultado));
+        if (data) break;
+      } catch (_) { /* probamos el siguiente */ }
+    }
+
+    if (!data) {
+      return res.json({ ok: false, error: 'AFIP no devolvió datos para ese CUIT' });
+    }
+
+    const p = data.datosGenerales || data;
+    const razonSocial = (
+      p.razonSocial ||
+      [p.apellido, p.nombre].filter(Boolean).join(', ')
+    );
+
+    if (!razonSocial) {
+      return res.json({ ok: false, error: 'El padrón no devolvió razón social' });
+    }
+
+    // Determinar condición frente al IVA
+    let ivaCodigo = '';
+    let condicionIva = '';
+    const mono = data.datosMonotributo;
+    const reg  = data.datosRegimenGeneral;
+    if (mono) {
+      ivaCodigo = 'MO';
+      condicionIva = 'Monotributista' + (mono.categoriaMonotributo ? ' Cat. ' + mono.categoriaMonotributo : '');
+    } else if (reg) {
+      const impuestos = (reg.impuesto || []).map(i => i.idImpuesto);
+      if (impuestos.includes(30)) { ivaCodigo = 'RI'; condicionIva = 'Responsable Inscripto'; }
+      else { ivaCodigo = 'EX'; condicionIva = 'Exento / No alcanzado'; }
+    }
+
+    res.json({
+      ok: true,
+      cuit: cuitConsultado,
+      razonSocial: String(razonSocial).trim(),
+      tipoPersona: p.tipoPersona || '',
+      estado: p.estadoClave || '',
+      domicilio: (p.domicilioFiscal && p.domicilioFiscal.direccion) || '',
+      localidad: (p.domicilioFiscal && p.domicilioFiscal.localidad) || '',
+      provincia: (p.domicilioFiscal && p.domicilioFiscal.descripcionProvincia) || '',
+      condicionIva,
+      ivaCodigo
+    });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── GET /health ────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ ok: true, servicio: 'FidelizApp AFIP Server', version: '1.0.0' });
