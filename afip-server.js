@@ -144,14 +144,134 @@ function auth(req, res, next) {
   return requiereSuperadmin(req, res, next);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+// ALMACÉN DE CERTIFICADOS — Supabase (permanente) con respaldo en disco
+//
+// El disco de Render se borra en cada reinicio. Los certificados viven en
+// Supabase, cifrados, y se copian al disco sólo mientras el servidor corre.
+// ══════════════════════════════════════════════════════════════════════════════
+const crypto = require('crypto');
+
+// El CUIT puede llegar con guiones o puntos. Adentro siempre se usa sólo dígitos.
+function _cuit(x) { return String(x || '').replace(/\D/g, ''); }
+
+
+// Clave para cifrar los certificados antes de guardarlos
+const CERT_SECRET = process.env.CERT_SECRET || '';
+const _claveCifrado = CERT_SECRET
+  ? crypto.createHash('sha256').update(CERT_SECRET).digest()
+  : null;
+
+function cifrar(texto) {
+  if (!_claveCifrado) return texto;                 // sin clave, se guarda tal cual
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', _claveCifrado, iv);
+  const enc = Buffer.concat([c.update(texto, 'utf8'), c.final()]);
+  return 'v1:' + iv.toString('base64') + ':' + c.getAuthTag().toString('base64') + ':' + enc.toString('base64');
+}
+
+function descifrar(dato) {
+  if (!dato || !String(dato).startsWith('v1:')) return dato;
+  if (!_claveCifrado) throw new Error('Falta CERT_SECRET para descifrar los certificados');
+  const [, ivB, tagB, datosB] = String(dato).split(':');
+  const d = crypto.createDecipheriv('aes-256-gcm', _claveCifrado, Buffer.from(ivB, 'base64'));
+  d.setAuthTag(Buffer.from(tagB, 'base64'));
+  return Buffer.concat([d.update(Buffer.from(datosB, 'base64')), d.final()]).toString('utf8');
+}
+
+// Acceso a la tabla afip_certificados de Supabase
+const SUPA_SERVICE = process.env.SUPABASE_SERVICE_KEY || '';
+
+function supaDisponible() {
+  return !!(SUPABASE_URL && SUPA_SERVICE);
+}
+
+async function supaFetch(ruta, opciones = {}) {
+  const r = await fetch(SUPABASE_URL.replace(/\/+$/, '') + '/rest/v1' + ruta, {
+    ...opciones,
+    headers: {
+      'apikey': SUPA_SERVICE,
+      'Authorization': 'Bearer ' + SUPA_SERVICE,
+      'Content-Type': 'application/json',
+      'Prefer': 'resolution=merge-duplicates,return=representation',
+      ...(opciones.headers || {})
+    }
+  });
+  const txt = await r.text();
+  let data; try { data = txt ? JSON.parse(txt) : null; } catch (_) { data = txt; }
+  if (!r.ok) throw new Error((data && data.message) || ('Supabase HTTP ' + r.status));
+  return data;
+}
+
+// Guarda el certificado de un CUIT de forma permanente
+async function guardarCertificado(cuitRaw, cert, key, userId) {
+  const cuit = _cuit(cuitRaw);
+  // 1) Siempre al disco, para uso inmediato
+  fs.writeFileSync(path.join(CERTS_DIR, `${cuit}.crt`), cert, 'utf8');
+  fs.writeFileSync(path.join(CERTS_DIR, `${cuit}.key`), key,  'utf8');
+  fs.writeFileSync(path.join(CERTS_DIR, `${cuit}.owner`), userId, 'utf8');
+
+  // 2) Y a Supabase, para que sobreviva a los reinicios
+  if (!supaDisponible()) {
+    console.warn('⚠️  Sin SUPABASE_SERVICE_KEY: el certificado de', cuit, 'se pierde al reiniciar.');
+    return { permanente: false };
+  }
+  await supaFetch('/afip_certificados', {
+    method: 'POST',
+    body: JSON.stringify({
+      cuit: cuit,
+      cert: cifrar(cert),
+      key_privada: cifrar(key),
+      user_id: userId,
+      actualizado: new Date().toISOString()
+    })
+  });
+  console.log('[AFIP] Certificado de', cuit, 'guardado en Supabase');
+  return { permanente: true };
+}
+
+// Recupera el certificado desde Supabase si no está en disco
+async function asegurarCertificado(cuitRaw) {
+  const cuit = _cuit(cuitRaw);
+  const certPath = path.join(CERTS_DIR, `${cuit}.crt`);
+  if (fs.existsSync(certPath)) return true;
+  if (!supaDisponible()) return false;
+
+  const filas = await supaFetch('/afip_certificados?cuit=eq.' + encodeURIComponent(cuit) + '&select=*');
+  if (!filas || !filas.length) return false;
+
+  const f = filas[0];
+  fs.writeFileSync(certPath, descifrar(f.cert), 'utf8');
+  fs.writeFileSync(path.join(CERTS_DIR, `${cuit}.key`), descifrar(f.key_privada), 'utf8');
+  fs.writeFileSync(path.join(CERTS_DIR, `${cuit}.owner`), f.user_id || '', 'utf8');
+  console.log('[AFIP] Certificado de', cuit, 'restaurado desde Supabase');
+  return true;
+}
+
+// Quién registró ese CUIT (consulta disco, y si no está, Supabase)
+async function dueñoDelCuit(cuitRaw) {
+  const cuit = _cuit(cuitRaw);
+  const p = path.join(CERTS_DIR, `${cuit}.owner`);
+  if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8').trim();
+  if (!supaDisponible()) return null;
+  const filas = await supaFetch('/afip_certificados?cuit=eq.' + encodeURIComponent(cuit) + '&select=user_id');
+  return (filas && filas.length) ? filas[0].user_id : null;
+}
+
 // ── Cache de instancias Afip por CUIT ──────────────────────────────────────
 const cache = {};
 
-async function getAfip(cuit, test) {
-  const Afip = require('@afipsdk/afip.js');
+async function getAfip(cuitRaw, test) {
+  const cuit = _cuit(cuitRaw);
+  if (cuit.length !== 11) throw new Error('CUIT inválido: ' + cuitRaw);
   const certPath  = path.join(CERTS_DIR, `${cuit}.crt`);
   const keyPath   = path.join(CERTS_DIR, `${cuit}.key`);
   const tokensDir = path.join(CERTS_DIR, `${cuit}_tokens`);
+
+  // Si el disco se borró por un reinicio, lo recuperamos de Supabase
+  if (!fs.existsSync(certPath)) await asegurarCertificado(cuit);
+
+  const Afip = require('@afipsdk/afip.js');
 
   if (!fs.existsSync(certPath)) {
     throw new Error(`Certificado no registrado para CUIT ${cuit}. Cargalo en Configuración → AFIP primero.`);
@@ -173,21 +293,45 @@ async function getAfip(cuit, test) {
 }
 
 // ── POST /register-cert — cargar certificado AFIP de un negocio ───────────
-app.post('/register-cert', rateLimit(10, 60000), requiereSuperadmin, async (req, res) => {
+app.post('/register-cert', rateLimit(10, 60000), requiereUsuario, async (req, res) => {
   try {
     const { cuit, cert, key } = req.body;
     if (!cuit || !cert || !key)
       return res.status(400).json({ error: 'Faltan datos: cuit, cert, key' });
 
-    fs.writeFileSync(path.join(CERTS_DIR, `${cuit}.crt`), cert, 'utf8');
-    fs.writeFileSync(path.join(CERTS_DIR, `${cuit}.key`), key,  'utf8');
+    const limpio = _cuit(cuit);
+    if (limpio.length !== 11) return res.status(400).json({ error: 'CUIT inválido' });
 
-    // Limpiar cache para forzar nueva instancia con nuevo certificado
-    delete cache[`${cuit}_test`];
-    delete cache[`${cuit}_prod`];
+    // Validación mínima del contenido: que sean archivos PEM de verdad
+    if (!/-----BEGIN CERTIFICATE-----/.test(cert))
+      return res.status(400).json({ error: 'El archivo de certificado no parece un .crt válido' });
+    if (!/-----BEGIN (RSA )?PRIVATE KEY-----/.test(key))
+      return res.status(400).json({ error: 'El archivo de clave no parece un .key válido' });
 
-    console.log(`[AFIP] Certificado guardado para CUIT ${cuit}`);
-    res.json({ ok: true, mensaje: `Certificado registrado para CUIT ${cuit}` });
+    // Cada CUIT queda asociado al usuario que lo registró primero.
+    // Después, sólo ese usuario (o el superadmin) puede reemplazarlo.
+    const dueño = await dueñoDelCuit(limpio);
+    if (dueño && dueño !== req.user.id && !req.esSuperadmin) {
+      console.warn('[SEG]', req.user.email, 'quiso pisar el certificado del CUIT', limpio);
+      return res.status(403).json({
+        error: 'Ese CUIT ya tiene un certificado cargado por otra cuenta. Contactate con soporte.'
+      });
+    }
+
+    const guardado = await guardarCertificado(limpio, cert, key, req.user.id);
+    console.log('[AFIP] Certificado de CUIT', limpio, 'registrado por', req.user.email);
+
+    // Limpiar cache para forzar nueva instancia con el nuevo certificado
+    delete cache[`${limpio}_test`];
+    delete cache[`${limpio}_prod`];
+
+    res.json({
+      ok: true,
+      mensaje: `Certificado registrado para CUIT ${limpio}`,
+      permanente: guardado.permanente,
+      aviso: guardado.permanente ? null
+        : 'Guardado sólo en memoria: configurá SUPABASE_SERVICE_KEY para que sobreviva a los reinicios.'
+    });
   } catch (e) {
     console.error('[AFIP] register-cert error:', e.message);
     res.status(500).json({ error: e.message });
@@ -198,6 +342,7 @@ app.post('/register-cert', rateLimit(10, 60000), requiereSuperadmin, async (req,
 app.post('/ultimo-cbte', rateLimit(60, 60000), requiereUsuario, async (req, res) => {
   try {
     const { cuit, ptoVenta, tipoCbte, test } = req.body;
+    await verificarCuitPropio(req, cuit);
     const afip  = await getAfip(cuit, !!test);
     const ultimo = await afip.ElectronicBilling.getLastVoucher(
       parseInt(ptoVenta), parseInt(tipoCbte)
@@ -205,14 +350,30 @@ app.post('/ultimo-cbte', rateLimit(60, 60000), requiereUsuario, async (req, res)
     res.json({ ok: true, ultimo });
   } catch (e) {
     console.error('[AFIP] ultimo-cbte error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
 // ── POST /factura — emitir comprobante y obtener CAE ─────────────────────
+// Verifica que el usuario sea dueño del CUIT con el que quiere operar
+async function verificarCuitPropio(req, cuit) {
+  const limpio = _cuit(cuit);
+  const dueño = await dueñoDelCuit(limpio);
+  if (!dueño) {
+    const e = new Error(`No hay certificado registrado para el CUIT ${limpio}. Cargalo en Configuración → AFIP.`);
+    e.status = 400; throw e;
+  }
+  if (dueño !== req.user.id && !req.esSuperadmin) {
+    const e = new Error('No podés facturar con un CUIT que no es tuyo');
+    e.status = 403; throw e;
+  }
+  return limpio;
+}
+
 app.post('/factura', rateLimit(60, 60000), requiereUsuario, async (req, res) => {
   try {
     const { cuit, test, factura } = req.body;
+    await verificarCuitPropio(req, cuit);
     // factura = { PtoVta, CbteTipo, Concepto, DocTipo, DocNro,
     //             CbteFch, ImpTotal, ImpNeto, ImpIVA, ImpTrib,
     //             MonId, MonCotiz, Iva[] }
@@ -259,7 +420,7 @@ app.post('/factura', rateLimit(60, 60000), requiereUsuario, async (req, res) => 
     });
   } catch (e) {
     console.error('[AFIP] factura error:', e.message);
-    res.status(500).json({ error: e.message });
+    res.status(e.status || 500).json({ error: e.message });
   }
 });
 
@@ -267,6 +428,7 @@ app.post('/factura', rateLimit(60, 60000), requiereUsuario, async (req, res) => 
 app.post('/puntos-venta', rateLimit(30, 60000), requiereUsuario, async (req, res) => {
   try {
     const { cuit, test } = req.body;
+    await verificarCuitPropio(req, cuit);
     const afip = await getAfip(cuit, !!test);
     const pts  = await afip.ElectronicBilling.getSalesPoints();
     res.json({ ok: true, puntos: pts });
@@ -279,13 +441,13 @@ app.post('/puntos-venta', rateLimit(30, 60000), requiereUsuario, async (req, res
 // Usa el primer CUIT con certificado registrado como "consultante" ante AFIP.
 app.get('/padron', rateLimit(30, 60000), requiereUsuario, async (req, res) => {
   try {
-    const cuitConsultado = String(req.query.cuit || '').replace(/\D/g, '');
+    const cuitConsultado = _cuit(req.query.cuit);
     if (cuitConsultado.length !== 11) {
       return res.status(400).json({ ok: false, error: 'CUIT inválido (deben ser 11 dígitos)' });
     }
 
     // CUIT que hace la consulta: el propio, o el primero con certificado cargado
-    let cuitConsultante = String(req.query.desde || '').replace(/\D/g, '');
+    let cuitConsultante = _cuit(req.query.desde);
     if (!cuitConsultante) {
       const disponibles = fs.existsSync(CERTS_DIR)
         ? fs.readdirSync(CERTS_DIR).filter(f => f.endsWith('.crt')).map(f => f.replace('.crt', ''))
@@ -606,6 +768,9 @@ app.get('/health', (req, res) => {
     seguridad: {
       autenticacion: (SUPABASE_URL && SUPABASE_ANON) ? 'Supabase (usuario real)' : '⚠️ SIN CONFIGURAR',
       superadmin:    SUPERADMIN ? 'configurado' : '⚠️ SIN CONFIGURAR',
+      certificados:  supaDisponible()
+        ? (CERT_SECRET ? 'Supabase, cifrados' : '⚠️ Supabase SIN CIFRAR (falta CERT_SECRET)')
+        : '⚠️ Sólo en disco temporal — se pierden al reiniciar',
       origenes:      ORIGENES
     }
   });
@@ -617,6 +782,11 @@ if (!SUPABASE_URL || !SUPABASE_ANON) {
 }
 if (!SUPERADMIN) {
   console.warn('⚠️  FALTA SUPERADMIN_EMAIL: nadie va a poder usar los endpoints de administración.');
+}
+if (!supaDisponible()) {
+  console.warn('⚠️  FALTA SUPABASE_SERVICE_KEY: los certificados AFIP se van a perder en cada reinicio.');
+} else if (!CERT_SECRET) {
+  console.warn('⚠️  FALTA CERT_SECRET: los certificados se guardan SIN CIFRAR.');
 }
 
 // ── Helper: fecha hoy YYYYMMDD ─────────────────────────────────────────────
