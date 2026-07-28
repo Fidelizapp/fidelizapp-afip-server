@@ -14,25 +14,134 @@ const os       = require('os');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
+// CORS: sólo nuestros dominios, no '*'
+app.set('trust proxy', 1);
 app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Content-Type, x-api-key');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  if (req.method === 'OPTIONS') return res.sendStatus(200);
+  const origen = req.headers.origin;
+  const permitidos = (process.env.ALLOWED_ORIGINS ||
+    'https://fidelizapp.com.ar,https://www.fidelizapp.com.ar')
+    .split(',').map(s => s.trim()).filter(Boolean);
+
+  if (origen && permitidos.includes(origen)) {
+    res.header('Access-Control-Allow-Origin', origen);
+    res.header('Vary', 'Origin');
+  }
+  res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, OPTIONS');
+  res.header('X-Content-Type-Options', 'nosniff');
+  res.header('Referrer-Policy', 'no-referrer');
+
+  if (req.method === 'OPTIONS') {
+    if (origen && !permitidos.includes(origen)) return res.sendStatus(403);
+    return res.sendStatus(204);
+  }
   next();
 });
 
 // ── Configuración ──────────────────────────────────────────────────────────
-const API_KEY   = process.env.AFIP_API_KEY || 'fidelizapp-afip-key';
+const API_KEY   = process.env.AFIP_API_KEY || '';
 const CERTS_DIR = process.env.CERTS_DIR    || path.join(os.tmpdir(), 'afip-certs');
+
+// Autenticación de usuarios reales contra Supabase
+const SUPABASE_URL   = process.env.SUPABASE_URL   || '';
+const SUPABASE_ANON  = process.env.SUPABASE_ANON_KEY || '';
+const SUPERADMIN     = (process.env.SUPERADMIN_EMAIL || '').toLowerCase().trim();
+
+// Sólo estos orígenes pueden llamar al servidor desde un navegador
+const ORIGENES = (process.env.ALLOWED_ORIGINS ||
+  'https://fidelizapp.com.ar,https://www.fidelizapp.com.ar')
+  .split(',').map(s => s.trim()).filter(Boolean);
 
 if (!fs.existsSync(CERTS_DIR)) fs.mkdirSync(CERTS_DIR, { recursive: true });
 
-// ── Auth middleware ────────────────────────────────────────────────────────
+// ── Límite de solicitudes por IP ───────────────────────────────────────────
+const _hits = new Map();
+function rateLimit(max, ventanaMs) {
+  return (req, res, next) => {
+    const ip = (req.headers['x-forwarded-for'] || req.ip || '').split(',')[0].trim();
+    const ahora = Date.now();
+    const clave = ip + '|' + req.path;
+    let reg = _hits.get(clave);
+    if (!reg || ahora - reg.desde > ventanaMs) reg = { desde: ahora, n: 0 };
+    reg.n++;
+    _hits.set(clave, reg);
+    if (_hits.size > 5000) {   // limpieza periódica
+      for (const [k, v] of _hits) if (ahora - v.desde > ventanaMs) _hits.delete(k);
+    }
+    if (reg.n > max) {
+      return res.status(429).json({ error: 'Demasiadas solicitudes. Esperá un momento.' });
+    }
+    next();
+  };
+}
+
+// ── Verificación del usuario contra Supabase ───────────────────────────────
+const _userCache = new Map();   // token → { user, exp }
+
+async function verificarUsuario(token) {
+  if (!token) return null;
+  if (!SUPABASE_URL || !SUPABASE_ANON) {
+    throw new Error('El servidor no tiene configurado SUPABASE_URL / SUPABASE_ANON_KEY');
+  }
+
+  const cacheado = _userCache.get(token);
+  if (cacheado && cacheado.exp > Date.now()) return cacheado.user;
+
+  const r = await fetch(SUPABASE_URL.replace(/\/+$/, '') + '/auth/v1/user', {
+    headers: { 'Authorization': 'Bearer ' + token, 'apikey': SUPABASE_ANON }
+  });
+  if (!r.ok) return null;
+
+  const u = await r.json();
+  if (!u || !u.id) return null;
+
+  const user = { id: u.id, email: (u.email || '').toLowerCase() };
+  _userCache.set(token, { user, exp: Date.now() + 5 * 60 * 1000 });   // 5 minutos
+  if (_userCache.size > 2000) _userCache.clear();
+  return user;
+}
+
+// ── Middleware: exige un usuario logueado en FidelizApp ────────────────────
+async function requiereUsuario(req, res, next) {
+  try {
+    // Origen: sólo desde nuestra web
+    const origen = req.headers.origin || req.headers.referer || '';
+    if (origen && !ORIGENES.some(o => origen.startsWith(o))) {
+      console.warn('[SEG] Origen rechazado:', origen);
+      return res.status(403).json({ error: 'Origen no permitido' });
+    }
+
+    const h = req.headers.authorization || '';
+    const token = h.startsWith('Bearer ') ? h.slice(7).trim() : '';
+    const user = await verificarUsuario(token);
+    if (!user) return res.status(401).json({ error: 'Sesión inválida o expirada. Volvé a iniciar sesión.' });
+
+    req.user = user;
+    req.esSuperadmin = !!SUPERADMIN && user.email === SUPERADMIN;
+    next();
+  } catch (e) {
+    console.error('[SEG] error verificando usuario:', e.message);
+    res.status(500).json({ error: 'No se pudo verificar la sesión' });
+  }
+}
+
+// ── Middleware: sólo el superadmin ─────────────────────────────────────────
+async function requiereSuperadmin(req, res, next) {
+  requiereUsuario(req, res, () => {
+    if (!req.esSuperadmin) {
+      console.warn('[SEG] Intento de acceso admin por', req.user && req.user.email);
+      return res.status(403).json({ error: 'Sólo el administrador de la plataforma puede hacer esto' });
+    }
+    next();
+  });
+}
+
+// ── Compatibilidad: llamadas servidor-a-servidor con clave ────────────────
+// Se usa sólo si configurás AFIP_API_KEY. No la usa el navegador.
 function auth(req, res, next) {
-  const k = req.headers['x-api-key'] || (req.body && req.body.apiKey);
-  if (k !== API_KEY) return res.status(401).json({ error: 'No autorizado' });
-  next();
+  const k = req.headers['x-api-key'];
+  if (API_KEY && k === API_KEY) { req.esSuperadmin = true; return next(); }
+  return requiereSuperadmin(req, res, next);
 }
 
 // ── Cache de instancias Afip por CUIT ──────────────────────────────────────
@@ -64,7 +173,7 @@ async function getAfip(cuit, test) {
 }
 
 // ── POST /register-cert — cargar certificado AFIP de un negocio ───────────
-app.post('/register-cert', auth, async (req, res) => {
+app.post('/register-cert', rateLimit(10, 60000), requiereSuperadmin, async (req, res) => {
   try {
     const { cuit, cert, key } = req.body;
     if (!cuit || !cert || !key)
@@ -86,7 +195,7 @@ app.post('/register-cert', auth, async (req, res) => {
 });
 
 // ── POST /ultimo-cbte — último número de comprobante emitido ──────────────
-app.post('/ultimo-cbte', auth, async (req, res) => {
+app.post('/ultimo-cbte', rateLimit(60, 60000), requiereUsuario, async (req, res) => {
   try {
     const { cuit, ptoVenta, tipoCbte, test } = req.body;
     const afip  = await getAfip(cuit, !!test);
@@ -101,7 +210,7 @@ app.post('/ultimo-cbte', auth, async (req, res) => {
 });
 
 // ── POST /factura — emitir comprobante y obtener CAE ─────────────────────
-app.post('/factura', auth, async (req, res) => {
+app.post('/factura', rateLimit(60, 60000), requiereUsuario, async (req, res) => {
   try {
     const { cuit, test, factura } = req.body;
     // factura = { PtoVta, CbteTipo, Concepto, DocTipo, DocNro,
@@ -155,7 +264,7 @@ app.post('/factura', auth, async (req, res) => {
 });
 
 // ── POST /puntos-venta — listar puntos de venta habilitados ───────────────
-app.post('/puntos-venta', auth, async (req, res) => {
+app.post('/puntos-venta', rateLimit(30, 60000), requiereUsuario, async (req, res) => {
   try {
     const { cuit, test } = req.body;
     const afip = await getAfip(cuit, !!test);
@@ -168,7 +277,7 @@ app.post('/puntos-venta', auth, async (req, res) => {
 
 // ── GET /padron?cuit=XXXXXXXXXXX — razón social real desde el padrón AFIP ──
 // Usa el primer CUIT con certificado registrado como "consultante" ante AFIP.
-app.get('/padron', auth, async (req, res) => {
+app.get('/padron', rateLimit(30, 60000), requiereUsuario, async (req, res) => {
   try {
     const cuitConsultado = String(req.query.cuit || '').replace(/\D/g, '');
     if (cuitConsultado.length !== 11) {
@@ -279,17 +388,19 @@ async function mpFetch(ruta, opciones = {}) {
 
 // ── POST /mp/suscribir — crea la suscripción recurrente ───────────────────
 // body: { email, cardTokenId, monto, plan, negocioId, dni }
-app.post('/mp/suscribir', auth, async (req, res) => {
+app.post('/mp/suscribir', rateLimit(10, 60000), requiereUsuario, async (req, res) => {
   try {
     const { email, cardTokenId, monto, plan, negocioId } = req.body;
     if (!email)       return res.status(400).json({ ok:false, error:'Falta el email del pagador' });
     if (!cardTokenId) return res.status(400).json({ ok:false, error:'Falta el token de tarjeta' });
     if (!monto || monto <= 0) return res.status(400).json({ ok:false, error:'Importe inválido' });
 
+    // La referencia externa siempre la pone el SERVIDOR con el id del usuario
+    // autenticado. Así nadie puede hacerse pasar por otro negocio.
     const body = {
       reason: 'FidelizApp — ' + (plan || 'Suscripción mensual'),
-      external_reference: String(negocioId || ''),
-      payer_email: email,
+      external_reference: req.user.id + (negocioId ? ('|' + negocioId) : ''),
+      payer_email: req.user.email || email,
       card_token_id: cardTokenId,
       back_url: APP_URL,
       status: 'authorized',              // cobra el primer período de inmediato
@@ -326,8 +437,21 @@ app.post('/mp/suscribir', auth, async (req, res) => {
   }
 });
 
+// ── Comprueba que la suscripción le pertenezca a quien la quiere tocar ────
+async function verificarPropiedad(req, preapprovalId) {
+  const sub = await mpFetch('/preapproval/' + preapprovalId);
+  const ref = String(sub.external_reference || '');
+  const esDelUsuario = ref === req.user.id || ref.startsWith(req.user.id + '|');
+  if (!esDelUsuario && !req.esSuperadmin) {
+    const err = new Error('Esa suscripción no te pertenece');
+    err.status = 403;
+    throw err;
+  }
+  return sub;
+}
+
 // ── GET /mp/planes — lista los planes creados en el panel de Mercado Pago ──
-app.get('/mp/planes', auth, async (req, res) => {
+app.get('/mp/planes', rateLimit(30, 60000), requiereSuperadmin, async (req, res) => {
   try {
     const r = await mpFetch('/preapproval_plan/search?status=active');
     const planes = (r.results || []).map(p => ({
@@ -346,16 +470,19 @@ app.get('/mp/planes', auth, async (req, res) => {
 
 // ── POST /mp/cancelar — BOTÓN DE BAJA: corta el débito de verdad ──────────
 // body: { preapprovalId }
-app.post('/mp/cancelar', auth, async (req, res) => {
+app.post('/mp/cancelar', rateLimit(10, 60000), requiereUsuario, async (req, res) => {
   try {
     const { preapprovalId } = req.body;
     if (!preapprovalId) return res.status(400).json({ ok:false, error:'Falta el id de la suscripción' });
+
+    await verificarPropiedad(req, preapprovalId);
 
     const sub = await mpFetch('/preapproval/' + preapprovalId, {
       method: 'PUT',
       body: JSON.stringify({ status: 'cancelled' })
     });
 
+    console.log('[BAJA]', req.user.email, '→', preapprovalId, sub.status);
     res.json({ ok:true, id: sub.id, status: sub.status, cancelada: sub.status === 'cancelled' });
   } catch (e) {
     res.status(e.status || 500).json({ ok:false, error: e.message, detalle: e.detalle || null });
@@ -363,10 +490,11 @@ app.post('/mp/cancelar', auth, async (req, res) => {
 });
 
 // ── POST /mp/pausar — suspende sin dar de baja ────────────────────────────
-app.post('/mp/pausar', auth, async (req, res) => {
+app.post('/mp/pausar', rateLimit(10, 60000), requiereUsuario, async (req, res) => {
   try {
     const { preapprovalId } = req.body;
     if (!preapprovalId) return res.status(400).json({ ok:false, error:'Falta el id de la suscripción' });
+    await verificarPropiedad(req, preapprovalId);
     const sub = await mpFetch('/preapproval/' + preapprovalId, {
       method: 'PUT', body: JSON.stringify({ status: 'paused' })
     });
@@ -377,9 +505,9 @@ app.post('/mp/pausar', auth, async (req, res) => {
 });
 
 // ── GET /mp/suscripcion/:id — estado real en Mercado Pago ─────────────────
-app.get('/mp/suscripcion/:id', auth, async (req, res) => {
+app.get('/mp/suscripcion/:id', rateLimit(60, 60000), requiereUsuario, async (req, res) => {
   try {
-    const sub = await mpFetch('/preapproval/' + req.params.id);
+    const sub = await verificarPropiedad(req, req.params.id);
     res.json({
       ok: true,
       id: sub.id,
@@ -396,10 +524,12 @@ app.get('/mp/suscripcion/:id', auth, async (req, res) => {
 
 // ── POST /mp/reembolsar — ARREPENTIMIENTO: cancela y devuelve lo cobrado ──
 // body: { preapprovalId }
-app.post('/mp/reembolsar', auth, async (req, res) => {
+app.post('/mp/reembolsar', rateLimit(5, 60000), requiereUsuario, async (req, res) => {
   try {
     const { preapprovalId } = req.body;
     if (!preapprovalId) return res.status(400).json({ ok:false, error:'Falta el id de la suscripción' });
+
+    await verificarPropiedad(req, preapprovalId);
 
     // 1) Cancelamos la suscripción para que no se generen más cobros
     await mpFetch('/preapproval/' + preapprovalId, {
@@ -452,7 +582,7 @@ app.post('/mp/webhook', async (req, res) => {
 });
 
 // ── GET /mp/estado — diagnóstico de la configuración ──────────────────────
-app.get('/mp/estado', auth, async (req, res) => {
+app.get('/mp/estado', rateLimit(30, 60000), requiereSuperadmin, async (req, res) => {
   if (!MP_TOKEN) return res.json({ ok:false, configurado:false, error:'Falta MP_ACCESS_TOKEN' });
   try {
     const me = await mpFetch('/users/me');
@@ -469,8 +599,25 @@ app.get('/mp/estado', auth, async (req, res) => {
 
 // ── GET /health ────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ ok: true, servicio: 'FidelizApp AFIP Server', version: '1.0.0' });
+  res.json({
+    ok: true,
+    servicio: 'FidelizApp AFIP Server',
+    version: '2.0.0',
+    seguridad: {
+      autenticacion: (SUPABASE_URL && SUPABASE_ANON) ? 'Supabase (usuario real)' : '⚠️ SIN CONFIGURAR',
+      superadmin:    SUPERADMIN ? 'configurado' : '⚠️ SIN CONFIGURAR',
+      origenes:      ORIGENES
+    }
+  });
 });
+
+// Aviso al arrancar si falta configuración de seguridad
+if (!SUPABASE_URL || !SUPABASE_ANON) {
+  console.warn('⚠️  FALTAN SUPABASE_URL y/o SUPABASE_ANON_KEY: las llamadas del navegador serán rechazadas.');
+}
+if (!SUPERADMIN) {
+  console.warn('⚠️  FALTA SUPERADMIN_EMAIL: nadie va a poder usar los endpoints de administración.');
+}
 
 // ── Helper: fecha hoy YYYYMMDD ─────────────────────────────────────────────
 function _hoy() {
