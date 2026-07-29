@@ -581,6 +581,12 @@ app.post('/mp/suscribir', rateLimit(10, 60000), requiereUsuario, async (req, res
 
     const sub = await mpFetch('/preapproval', { method:'POST', body: JSON.stringify(body) });
 
+    // Activar la cuenta enseguida, sin esperar al webhook: si el negocio
+    // venía con la prueba vencida, tiene que poder entrar ya mismo.
+    if (_mpEstaAlDia(sub.status)) {
+      await marcarSuscripcion(req.user.id, true, sub.id, plan);
+    }
+
     res.json({
       ok: true,
       id: sub.id,
@@ -645,6 +651,9 @@ app.post('/mp/cancelar', rateLimit(10, 60000), requiereUsuario, async (req, res)
     });
 
     console.log('[BAJA]', req.user.email, '→', preapprovalId, sub.status);
+    if (sub.status === 'cancelled') {
+      await marcarSuscripcion(sub.external_reference || req.user.id, false);
+    }
     res.json({ ok:true, id: sub.id, status: sub.status, cancelada: sub.status === 'cancelled' });
   } catch (e) {
     res.status(e.status || 500).json({ ok:false, error: e.message, detalle: e.detalle || null });
@@ -721,6 +730,38 @@ app.post('/mp/reembolsar', rateLimit(5, 60000), requiereUsuario, async (req, res
 
 // ── POST /mp/webhook — notificaciones de Mercado Pago ─────────────────────
 // Configurar esta URL en el panel de MP. NO lleva x-api-key: la llama Mercado Pago.
+
+// ── Activar / desactivar la cuenta de un negocio ───────────────────────────
+// Lo hace el servidor con la clave de servicio: el navegador no puede
+// marcarse a sí mismo como pago.
+async function marcarSuscripcion(userId, activa, preapprovalId, plan) {
+  if (!supaDisponible()) {
+    console.warn('[Suscripción] No se pudo actualizar: falta SUPABASE_SERVICE_KEY');
+    return false;
+  }
+  if (!userId) return false;
+  try {
+    const cambios = { suscripcion_activa: !!activa };
+    if (preapprovalId) cambios.preapproval_id = preapprovalId;
+    if (plan)          cambios.plan           = plan;
+    await supaFetch('/negocios?user_id=eq.' + encodeURIComponent(userId), {
+      method:  'PATCH',
+      headers: { 'Prefer': 'return=minimal' },
+      body:    JSON.stringify(cambios)
+    });
+    console.log('[Suscripción] Negocio del usuario', userId, activa ? '→ ACTIVA' : '→ dada de baja');
+    return true;
+  } catch (e) {
+    console.error('[Suscripción] Error al actualizar:', e.message);
+    return false;
+  }
+}
+
+// Estados de Mercado Pago que significan "está pagando"
+function _mpEstaAlDia(status) {
+  return status === 'authorized';
+}
+
 app.post('/mp/webhook', async (req, res) => {
   try {
     const tipo = req.body.type || req.query.type;
@@ -730,11 +771,19 @@ app.post('/mp/webhook', async (req, res) => {
     if (tipo === 'subscription_preapproval' && id) {
       const sub = await mpFetch('/preapproval/' + id);
       console.log('[MP] suscripción', sub.id, '→', sub.status, '| ref:', sub.external_reference);
-      // Acá podés actualizar tu base (Supabase) con el estado real.
+      // external_reference lo pone este servidor y es el user_id del negocio
+      if (sub.external_reference) {
+        await marcarSuscripcion(sub.external_reference, _mpEstaAlDia(sub.status), sub.id);
+      }
     }
     if (tipo === 'payment' && id) {
       const pago = await mpFetch('/v1/payments/' + id);
       console.log('[MP] pago', pago.id, '→', pago.status, '| $', pago.transaction_amount);
+      // Un pago rechazado no da de baja por sí solo: Mercado Pago reintenta.
+      // La baja llega por el evento de suscripción cuando pasa a 'cancelled'.
+      if (pago.status === 'approved' && pago.external_reference) {
+        await marcarSuscripcion(pago.external_reference, true);
+      }
     }
     res.sendStatus(200);   // MP reintenta si no devolvés 200/201
   } catch (e) {
@@ -760,11 +809,135 @@ app.get('/mp/estado', rateLimit(30, 60000), requiereSuperadmin, async (req, res)
 });
 
 // ── GET /health ────────────────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════
+//  ASISTENTE CON IA
+//  El navegador manda la pregunta + los manuales de la plataforma.
+//  La clave de la IA vive SÓLO acá; nunca viaja al navegador.
+// ═══════════════════════════════════════════════════════════════════════════
+
+const IA_KEY      = process.env.ANTHROPIC_API_KEY || '';
+const IA_MODELO   = process.env.IA_MODELO || 'claude-sonnet-5';
+const IA_MAX_CHARS = 60000;   // techo de manuales por consulta, para acotar el costo
+
+// Tope de consultas por usuario y por día, para que nadie dispare la factura
+const IA_TOPE_DIARIO = parseInt(process.env.IA_TOPE_DIARIO || '40', 10);
+const _iaUso = new Map();   // userId → { dia, cuenta }
+
+function _iaPuedeConsultar(userId) {
+  const hoy = new Date().toISOString().slice(0, 10);
+  const u = _iaUso.get(userId);
+  if (!u || u.dia !== hoy) {
+    _iaUso.set(userId, { dia: hoy, cuenta: 1 });
+    return { ok: true, restantes: IA_TOPE_DIARIO - 1 };
+  }
+  if (u.cuenta >= IA_TOPE_DIARIO) return { ok: false, restantes: 0 };
+  u.cuenta++;
+  return { ok: true, restantes: IA_TOPE_DIARIO - u.cuenta };
+}
+
+app.post('/ia/consultar', rateLimit(20, 60000), requiereUsuario, async (req, res) => {
+  if (!IA_KEY) {
+    return res.status(503).json({ error: 'El asistente inteligente todavía no está configurado' });
+  }
+
+  const pregunta = String(req.body.pregunta || '').trim().slice(0, 2000);
+  if (!pregunta) return res.status(400).json({ error: 'Falta la pregunta' });
+
+  const cupo = _iaPuedeConsultar(req.user.id);
+  if (!cupo.ok) {
+    return res.status(429).json({ error: 'Llegaste al límite de consultas por hoy. Volvé a intentar mañana.' });
+  }
+
+  const manuales = String(req.body.manuales || '').slice(0, IA_MAX_CHARS);
+  const contexto = req.body.contexto && typeof req.body.contexto === 'object' ? req.body.contexto : {};
+
+  const sistema = [
+    'Sos el asistente de FidelizApp, un sistema de gestión para comercios argentinos.',
+    'Le hablás a la persona que atiende el negocio, no a un programador.',
+    '',
+    'Cómo respondés:',
+    '- En español rioplatense (vos, tenés, andá). Claro y corto.',
+    '- Si la respuesta está en los manuales, seguilos al pie de la letra y dale los pasos numerados.',
+    '- Si te preguntan algo que los manuales no cubren, decilo con honestidad y sugerí escribir a soporte. No inventes.',
+    '- Nunca inventes montos, plazos legales, ni pasos de trámites de AFIP que no estén en los manuales.',
+    '- No uses tablas de markdown ni bloques de código: la respuesta se muestra en un chat chiquito.',
+    '- Máximo 200 palabras salvo que te pidan el detalle completo.',
+    '',
+    'Datos del negocio que está preguntando (usalos si vienen al caso):',
+    JSON.stringify(contexto, null, 2),
+    '',
+    manuales
+      ? 'MANUALES OFICIALES DE LA PLATAFORMA:\n\n' + manuales
+      : 'No hay manuales cargados todavía. Respondé sólo lo que sepas con certeza del sistema y, si no estás seguro, decí que consulten a soporte.'
+  ].join('\n');
+
+  try {
+    const r = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'content-type':      'application/json',
+        'x-api-key':         IA_KEY,
+        'anthropic-version': '2023-06-01'
+      },
+      body: JSON.stringify({
+        model:      IA_MODELO,
+        max_tokens: 900,
+        system:     sistema,
+        messages:   [{ role: 'user', content: pregunta }]
+      })
+    });
+
+    const d = await r.json();
+
+    if (!r.ok) {
+      console.error('[IA] Error de la API:', r.status, d && d.error && d.error.message);
+      const msg = (d && d.error && d.error.message) || '';
+      if (r.status === 401) return res.status(503).json({ error: 'La clave del asistente no es válida' });
+      if (r.status === 429) return res.status(429).json({ error: 'El asistente está saturado. Probá en un minuto.' });
+      if (/credit|balance/i.test(msg)) return res.status(503).json({ error: 'El asistente se quedó sin crédito' });
+      return res.status(502).json({ error: 'El asistente no pudo responder' });
+    }
+
+    const texto = (d.content || [])
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('\n')
+      .trim();
+
+    res.json({
+      respuesta: texto,
+      restantes: cupo.restantes,
+      uso: d.usage || null
+    });
+
+  } catch (e) {
+    console.error('[IA] Fallo al consultar:', e.message);
+    res.status(502).json({ error: 'No se pudo contactar al asistente' });
+  }
+});
+
+// Diagnóstico para el superadmin: cuánto se está usando la IA
+app.get('/ia/estado', rateLimit(30, 60000), requiereSuperadmin, (req, res) => {
+  const hoy = new Date().toISOString().slice(0, 10);
+  let usuariosHoy = 0, consultasHoy = 0;
+  for (const u of _iaUso.values()) {
+    if (u.dia === hoy) { usuariosHoy++; consultasHoy += u.cuenta; }
+  }
+  res.json({
+    configurado:  !!IA_KEY,
+    modelo:       IA_MODELO,
+    topeDiario:   IA_TOPE_DIARIO,
+    usuariosHoy,
+    consultasHoy
+  });
+});
+
+
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
     servicio: 'FidelizApp AFIP Server',
-    version: '2.0.0',
+    version: '2.1.0',
     seguridad: {
       autenticacion: (SUPABASE_URL && SUPABASE_ANON) ? 'Supabase (usuario real)' : '⚠️ SIN CONFIGURAR',
       superadmin:    SUPERADMIN ? 'configurado' : '⚠️ SIN CONFIGURAR',
@@ -772,7 +945,8 @@ app.get('/health', (req, res) => {
         ? (CERT_SECRET ? 'Supabase, cifrados' : '⚠️ Supabase SIN CIFRAR (falta CERT_SECRET)')
         : '⚠️ Sólo en disco temporal — se pierden al reiniciar',
       origenes:      ORIGENES
-    }
+    },
+    asistenteIA: IA_KEY ? ('activo (' + IA_MODELO + ')') : '⚠️ SIN CONFIGURAR (falta ANTHROPIC_API_KEY)'
   });
 });
 
@@ -787,6 +961,9 @@ if (!supaDisponible()) {
   console.warn('⚠️  FALTA SUPABASE_SERVICE_KEY: los certificados AFIP se van a perder en cada reinicio.');
 } else if (!CERT_SECRET) {
   console.warn('⚠️  FALTA CERT_SECRET: los certificados se guardan SIN CIFRAR.');
+}
+if (!IA_KEY) {
+  console.warn('⚠️  FALTA ANTHROPIC_API_KEY: el asistente inteligente va a responder sólo con las reglas básicas.');
 }
 
 // ── Helper: fecha hoy YYYYMMDD ─────────────────────────────────────────────
