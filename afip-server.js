@@ -818,15 +818,45 @@ app.get('/mp/estado', rateLimit(30, 60000), requiereSuperadmin, async (req, res)
 // Soporta dos proveedores. Si están las dos claves, manda la de Gemini
 // (gratis). Si no hay ninguna, el asistente queda apagado y la app usa
 // sus respuestas de respaldo.
-const GEMINI_KEY    = process.env.GEMINI_API_KEY || '';
-const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
-const IA_PROVEEDOR  = GEMINI_KEY ? 'gemini' : (ANTHROPIC_KEY ? 'anthropic' : '');
-const IA_KEY        = GEMINI_KEY || ANTHROPIC_KEY;
+const GROQ_KEY       = process.env.GROQ_API_KEY       || '';
+const GEMINI_KEY     = process.env.GEMINI_API_KEY     || '';
+const OPENROUTER_KEY = process.env.OPENROUTER_API_KEY || '';
+const ANTHROPIC_KEY  = process.env.ANTHROPIC_API_KEY  || '';
 
-const IA_MODELO = process.env.IA_MODELO ||
-  (IA_PROVEEDOR === 'gemini' ? 'gemini-2.5-flash' : 'claude-sonnet-5');
+// Orden de preferencia por generosidad del nivel gratuito.
+// Se puede forzar uno con la variable IA_PROVEEDOR.
+const _DISPONIBLES = [
+  ['groq',       GROQ_KEY],
+  ['gemini',     GEMINI_KEY],
+  ['openrouter', OPENROUTER_KEY],
+  ['anthropic',  ANTHROPIC_KEY]
+].filter(([, k]) => !!k);
 
-const IA_MAX_CHARS = 60000;   // techo de manuales por consulta
+const _FORZADO = (process.env.IA_PROVEEDOR || '').toLowerCase().trim();
+const _ELEGIDO = _DISPONIBLES.find(([n]) => n === _FORZADO) || _DISPONIBLES[0] || null;
+
+const IA_PROVEEDOR = _ELEGIDO ? _ELEGIDO[0] : '';
+const IA_KEY       = _ELEGIDO ? _ELEGIDO[1] : '';
+
+const _MODELO_POR_DEFECTO = {
+  groq:       'llama-3.3-70b-versatile',
+  gemini:     'gemini-2.5-flash',
+  openrouter: 'meta-llama/llama-3.3-70b-instruct:free',
+  anthropic:  'claude-sonnet-5'
+};
+const IA_MODELO = process.env.IA_MODELO || _MODELO_POR_DEFECTO[IA_PROVEEDOR] || '';
+
+// Cuántos caracteres de manuales mandamos. Groq tiene un techo bajo de
+// tokens por minuto (6.000), así que con él recortamos bastante más.
+const _TOPE_MANUALES = { groq: 12000, openrouter: 20000, gemini: 60000, anthropic: 60000 };
+const IA_MAX_CHARS = _TOPE_MANUALES[IA_PROVEEDOR] || 20000;
+
+const NOMBRE_PROVEEDOR = {
+  groq:       'Groq (gratis)',
+  gemini:     'Google Gemini (gratis)',
+  openrouter: 'OpenRouter (gratis)',
+  anthropic:  'Anthropic Claude'
+};
 
 // Tope de consultas por usuario y por día, para que nadie dispare la factura
 const IA_TOPE_DIARIO = parseInt(process.env.IA_TOPE_DIARIO || '40', 10);
@@ -892,9 +922,64 @@ app.post('/ia/consultar', rateLimit(20, 60000), requiereUsuario, async (req, res
 
 // ── Llamada al modelo, según el proveedor configurado ─────────────────────
 async function preguntarAlModelo(sistema, pregunta) {
-  return IA_PROVEEDOR === 'gemini'
-    ? preguntarGemini(sistema, pregunta)
-    : preguntarClaude(sistema, pregunta);
+  if (IA_PROVEEDOR === 'gemini')     return preguntarGemini(sistema, pregunta);
+  if (IA_PROVEEDOR === 'groq')       return preguntarEstiloOpenAI(sistema, pregunta, 'groq');
+  if (IA_PROVEEDOR === 'openrouter') return preguntarEstiloOpenAI(sistema, pregunta, 'openrouter');
+  return preguntarClaude(sistema, pregunta);
+}
+
+// Groq y OpenRouter usan el mismo formato que OpenAI, así que comparten código
+async function preguntarEstiloOpenAI(sistema, pregunta, cual) {
+  const conf = {
+    groq: {
+      url: 'https://api.groq.com/openai/v1/chat/completions',
+      headers: { 'Authorization': 'Bearer ' + GROQ_KEY },
+      nombre: 'Groq'
+    },
+    openrouter: {
+      url: 'https://openrouter.ai/api/v1/chat/completions',
+      headers: {
+        'Authorization': 'Bearer ' + OPENROUTER_KEY,
+        'HTTP-Referer': APP_URL,
+        'X-Title': 'FidelizApp'
+      },
+      nombre: 'OpenRouter'
+    }
+  }[cual];
+
+  const r = await fetch(conf.url, {
+    method: 'POST',
+    headers: Object.assign({ 'content-type': 'application/json' }, conf.headers),
+    body: JSON.stringify({
+      model: IA_MODELO,
+      messages: [
+        { role: 'system', content: sistema },
+        { role: 'user',   content: pregunta }
+      ],
+      max_tokens: 1400,
+      temperature: 0.9
+    })
+  });
+
+  const d = await r.json().catch(() => ({}));
+
+  if (!r.ok) {
+    const msg = (d && d.error && (d.error.message || d.error)) || ('HTTP ' + r.status);
+    console.error('[IA/' + conf.nombre + ']', r.status, msg);
+    if (r.status === 401) throw _errIA(503, 'La clave del asistente no es válida', msg);
+    if (r.status === 403) throw _errIA(503, 'La clave del asistente no tiene permisos', msg);
+    if (r.status === 429) throw _errIA(429, 'Se llegó al límite gratuito del asistente. Probá más tarde.', msg);
+    if (r.status === 404) throw _errIA(503, 'El modelo configurado ya no existe. Hay que actualizarlo.', msg);
+    if (/context|too large|tokens/i.test(String(msg))) {
+      throw _errIA(502, 'La consulta quedó demasiado larga. Probá con menos manuales cargados.', msg);
+    }
+    throw _errIA(502, 'El asistente no pudo responder', msg);
+  }
+
+  const elec = (d.choices || [])[0];
+  const texto = (elec && elec.message && elec.message.content || '').trim();
+  if (!texto) throw _errIA(502, 'El asistente devolvió una respuesta vacía', JSON.stringify(d).slice(0,200));
+  return { texto, uso: d.usage || null };
 }
 
 function _errIA(status, publico, detalle) {
@@ -1001,7 +1086,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     servicio: 'FidelizApp AFIP Server',
-    version: '2.2.0',
+    version: '2.3.0',
     seguridad: {
       autenticacion: (SUPABASE_URL && SUPABASE_ANON) ? 'Supabase (usuario real)' : '⚠️ SIN CONFIGURAR',
       superadmin:    SUPERADMIN ? 'configurado' : '⚠️ SIN CONFIGURAR',
@@ -1011,8 +1096,9 @@ app.get('/health', (req, res) => {
       origenes:      ORIGENES
     },
     asistenteIA: IA_KEY
-      ? ('activo · ' + (IA_PROVEEDOR === 'gemini' ? 'Google Gemini (gratis)' : 'Anthropic Claude') + ' · ' + IA_MODELO)
-      : '⚠️ SIN CONFIGURAR (falta GEMINI_API_KEY o ANTHROPIC_API_KEY)'
+      ? ('activo · ' + (NOMBRE_PROVEEDOR[IA_PROVEEDOR] || IA_PROVEEDOR) + ' · ' + IA_MODELO)
+      : '⚠️ SIN CONFIGURAR (poné GROQ_API_KEY, GEMINI_API_KEY, OPENROUTER_API_KEY o ANTHROPIC_API_KEY)',
+    iaDisponibles: _DISPONIBLES.map(([n]) => n)
   });
 });
 
@@ -1029,9 +1115,14 @@ if (!supaDisponible()) {
   console.warn('⚠️  FALTA CERT_SECRET: los certificados se guardan SIN CIFRAR.');
 }
 if (!IA_KEY) {
-  console.warn('⚠️  FALTA GEMINI_API_KEY (gratis) o ANTHROPIC_API_KEY: el asistente va a responder sólo con las reglas básicas.');
+  console.warn('⚠️  Sin clave de IA: el asistente va a responder sólo con las reglas básicas.');
+  console.warn('    Opciones gratis: GROQ_API_KEY (la más generosa), GEMINI_API_KEY, OPENROUTER_API_KEY.');
 } else {
-  console.log('🤖 Asistente: ' + (IA_PROVEEDOR === 'gemini' ? 'Google Gemini (nivel gratuito)' : 'Anthropic Claude') + ' — modelo ' + IA_MODELO);
+  console.log('🤖 Asistente: ' + (NOMBRE_PROVEEDOR[IA_PROVEEDOR] || IA_PROVEEDOR) + ' — modelo ' + IA_MODELO);
+  if (_DISPONIBLES.length > 1) {
+    console.log('   También hay clave de: ' + _DISPONIBLES.filter(([n]) => n !== IA_PROVEEDOR).map(([n]) => n).join(', ') +
+                '. Para usar otro, poné IA_PROVEEDOR con ese nombre.');
+  }
 }
 
 // ── Helper: fecha hoy YYYYMMDD ─────────────────────────────────────────────
