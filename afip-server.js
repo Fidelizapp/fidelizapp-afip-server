@@ -815,9 +815,18 @@ app.get('/mp/estado', rateLimit(30, 60000), requiereSuperadmin, async (req, res)
 //  La clave de la IA vive SÓLO acá; nunca viaja al navegador.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const IA_KEY      = process.env.ANTHROPIC_API_KEY || '';
-const IA_MODELO   = process.env.IA_MODELO || 'claude-sonnet-5';
-const IA_MAX_CHARS = 60000;   // techo de manuales por consulta, para acotar el costo
+// Soporta dos proveedores. Si están las dos claves, manda la de Gemini
+// (gratis). Si no hay ninguna, el asistente queda apagado y la app usa
+// sus respuestas de respaldo.
+const GEMINI_KEY    = process.env.GEMINI_API_KEY || '';
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || '';
+const IA_PROVEEDOR  = GEMINI_KEY ? 'gemini' : (ANTHROPIC_KEY ? 'anthropic' : '');
+const IA_KEY        = GEMINI_KEY || ANTHROPIC_KEY;
+
+const IA_MODELO = process.env.IA_MODELO ||
+  (IA_PROVEEDOR === 'gemini' ? 'gemini-2.5-flash' : 'claude-sonnet-5');
+
+const IA_MAX_CHARS = 60000;   // techo de manuales por consulta
 
 // Tope de consultas por usuario y por día, para que nadie dispare la factura
 const IA_TOPE_DIARIO = parseInt(process.env.IA_TOPE_DIARIO || '40', 10);
@@ -872,49 +881,103 @@ app.post('/ia/consultar', rateLimit(20, 60000), requiereUsuario, async (req, res
   ].join('\n');
 
   try {
-    const r = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'content-type':      'application/json',
-        'x-api-key':         IA_KEY,
-        'anthropic-version': '2023-06-01'
-      },
-      body: JSON.stringify({
-        model:      IA_MODELO,
-        max_tokens: 900,
-        system:     sistema,
-        messages:   [{ role: 'user', content: pregunta }]
-      })
-    });
-
-    const d = await r.json();
-
-    if (!r.ok) {
-      console.error('[IA] Error de la API:', r.status, d && d.error && d.error.message);
-      const msg = (d && d.error && d.error.message) || '';
-      if (r.status === 401) return res.status(503).json({ error: 'La clave del asistente no es válida' });
-      if (r.status === 429) return res.status(429).json({ error: 'El asistente está saturado. Probá en un minuto.' });
-      if (/credit|balance/i.test(msg)) return res.status(503).json({ error: 'El asistente se quedó sin crédito' });
-      return res.status(502).json({ error: 'El asistente no pudo responder' });
-    }
-
-    const texto = (d.content || [])
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('\n')
-      .trim();
-
-    res.json({
-      respuesta: texto,
-      restantes: cupo.restantes,
-      uso: d.usage || null
-    });
-
+    const { texto, uso } = await preguntarAlModelo(sistema, pregunta);
+    res.json({ respuesta: texto, restantes: cupo.restantes, uso, proveedor: IA_PROVEEDOR });
   } catch (e) {
+    const st = e.status || 502;
     console.error('[IA] Fallo al consultar:', e.message);
-    res.status(502).json({ error: 'No se pudo contactar al asistente' });
+    res.status(st).json({ error: e.publico || 'No se pudo contactar al asistente' });
   }
 });
+
+// ── Llamada al modelo, según el proveedor configurado ─────────────────────
+async function preguntarAlModelo(sistema, pregunta) {
+  return IA_PROVEEDOR === 'gemini'
+    ? preguntarGemini(sistema, pregunta)
+    : preguntarClaude(sistema, pregunta);
+}
+
+function _errIA(status, publico, detalle) {
+  const e = new Error(detalle || publico);
+  e.status = status; e.publico = publico;
+  return e;
+}
+
+// Google Gemini — tiene nivel gratuito
+async function preguntarGemini(sistema, pregunta) {
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' +
+              encodeURIComponent(IA_MODELO) + ':generateContent';
+
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
+    body: JSON.stringify({
+      system_instruction: { parts: [{ text: sistema }] },
+      contents: [{ role: 'user', parts: [{ text: pregunta }] }],
+      generationConfig: { maxOutputTokens: 1400, temperature: 0.9 }
+    })
+  });
+
+  const d = await r.json().catch(() => ({}));
+
+  if (!r.ok) {
+    const msg = (d && d.error && d.error.message) || ('HTTP ' + r.status);
+    console.error('[IA/Gemini]', r.status, msg);
+    if (r.status === 400 && /API key/i.test(msg)) throw _errIA(503, 'La clave del asistente no es válida', msg);
+    if (r.status === 403) throw _errIA(503, 'La clave del asistente no tiene permisos', msg);
+    if (r.status === 429) throw _errIA(429, 'Se llegó al límite diario gratuito del asistente. Volvé mañana.', msg);
+    throw _errIA(502, 'El asistente no pudo responder', msg);
+  }
+
+  const cand = (d.candidates || [])[0];
+  if (!cand) throw _errIA(502, 'El asistente no devolvió respuesta', JSON.stringify(d).slice(0,200));
+
+  // Gemini corta la respuesta si activa sus filtros de contenido
+  if (cand.finishReason && cand.finishReason !== 'STOP' && cand.finishReason !== 'MAX_TOKENS') {
+    throw _errIA(502, 'El asistente no pudo responder esa consulta', 'finishReason=' + cand.finishReason);
+  }
+
+  const texto = ((cand.content && cand.content.parts) || [])
+    .map(p => p.text || '').join('\n').trim();
+
+  if (!texto) throw _errIA(502, 'El asistente devolvió una respuesta vacía');
+  return { texto, uso: d.usageMetadata || null };
+}
+
+// Anthropic Claude — de pago, mejor calidad
+async function preguntarClaude(sistema, pregunta) {
+  const r = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type':      'application/json',
+      'x-api-key':         ANTHROPIC_KEY,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model:      IA_MODELO,
+      max_tokens: 1400,
+      system:     sistema,
+      messages:   [{ role: 'user', content: pregunta }]
+    })
+  });
+
+  const d = await r.json().catch(() => ({}));
+
+  if (!r.ok) {
+    const msg = (d && d.error && d.error.message) || ('HTTP ' + r.status);
+    console.error('[IA/Claude]', r.status, msg);
+    if (r.status === 401) throw _errIA(503, 'La clave del asistente no es válida', msg);
+    if (r.status === 429) throw _errIA(429, 'El asistente está saturado. Probá en un minuto.', msg);
+    if (/credit|balance/i.test(msg)) throw _errIA(503, 'El asistente se quedó sin crédito', msg);
+    throw _errIA(502, 'El asistente no pudo responder', msg);
+  }
+
+  const texto = (d.content || []).filter(b => b.type === 'text')
+    .map(b => b.text).join('\n').trim();
+
+  if (!texto) throw _errIA(502, 'El asistente devolvió una respuesta vacía');
+  return { texto, uso: d.usage || null };
+}
 
 // Diagnóstico para el superadmin: cuánto se está usando la IA
 app.get('/ia/estado', rateLimit(30, 60000), requiereSuperadmin, (req, res) => {
@@ -925,6 +988,7 @@ app.get('/ia/estado', rateLimit(30, 60000), requiereSuperadmin, (req, res) => {
   }
   res.json({
     configurado:  !!IA_KEY,
+    proveedor:    IA_PROVEEDOR || 'ninguno',
     modelo:       IA_MODELO,
     topeDiario:   IA_TOPE_DIARIO,
     usuariosHoy,
@@ -937,7 +1001,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     servicio: 'FidelizApp AFIP Server',
-    version: '2.1.0',
+    version: '2.2.0',
     seguridad: {
       autenticacion: (SUPABASE_URL && SUPABASE_ANON) ? 'Supabase (usuario real)' : '⚠️ SIN CONFIGURAR',
       superadmin:    SUPERADMIN ? 'configurado' : '⚠️ SIN CONFIGURAR',
@@ -946,7 +1010,9 @@ app.get('/health', (req, res) => {
         : '⚠️ Sólo en disco temporal — se pierden al reiniciar',
       origenes:      ORIGENES
     },
-    asistenteIA: IA_KEY ? ('activo (' + IA_MODELO + ')') : '⚠️ SIN CONFIGURAR (falta ANTHROPIC_API_KEY)'
+    asistenteIA: IA_KEY
+      ? ('activo · ' + (IA_PROVEEDOR === 'gemini' ? 'Google Gemini (gratis)' : 'Anthropic Claude') + ' · ' + IA_MODELO)
+      : '⚠️ SIN CONFIGURAR (falta GEMINI_API_KEY o ANTHROPIC_API_KEY)'
   });
 });
 
@@ -963,7 +1029,9 @@ if (!supaDisponible()) {
   console.warn('⚠️  FALTA CERT_SECRET: los certificados se guardan SIN CIFRAR.');
 }
 if (!IA_KEY) {
-  console.warn('⚠️  FALTA ANTHROPIC_API_KEY: el asistente inteligente va a responder sólo con las reglas básicas.');
+  console.warn('⚠️  FALTA GEMINI_API_KEY (gratis) o ANTHROPIC_API_KEY: el asistente va a responder sólo con las reglas básicas.');
+} else {
+  console.log('🤖 Asistente: ' + (IA_PROVEEDOR === 'gemini' ? 'Google Gemini (nivel gratuito)' : 'Anthropic Claude') + ' — modelo ' + IA_MODELO);
 }
 
 // ── Helper: fecha hoy YYYYMMDD ─────────────────────────────────────────────
